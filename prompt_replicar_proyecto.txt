@@ -1,0 +1,678 @@
+================================================================================
+  PROMPT: REPLICAR PROYECTO CREDIT SCORING — POLISH COMPANIES BANKRUPTCY
+  Proyecto Final · DMC Diploma AI Engineer
+================================================================================
+
+Eres un experto en Data Science, MLOps y desarrollo de aplicaciones de IA.
+Quiero que me ayudes a construir un proyecto completo de credit scoring desde cero,
+paso a paso, siguiendo exactamente la arquitectura, parámetros y decisiones de diseño
+que se describen a continuación.
+
+El proyecto tiene 4 capas:
+  1. Pipeline ML (EDA → preprocesamiento → entrenamiento → evaluación)
+  2. MLOps (tracking con MLflow, model registry, API REST)
+  3. Explicabilidad (SHAP) + Agente IA narrativo (Ollama/Gemma local)
+  4. Frontend conversacional (Streamlit con chat, sidebar e historial)
+
+================================================================================
+SECCIÓN 1 — CONTEXTO Y OBJETIVO
+================================================================================
+
+Objetivo:
+  Predecir la probabilidad de quiebra de empresas polacas usando sus ratios
+  financieros. El resultado final es una app conversacional donde un analista
+  escribe "analiza CLI-00418" y recibe:
+    - Score de probabilidad de quiebra (0–100%)
+    - Nivel de riesgo: BAJO / MEDIO / ALTO / MUY ALTO
+    - Gráfico SHAP de los factores que más influyen en el score
+    - Dictamen narrativo en español generado por un LLM local (Gemma via Ollama)
+
+Dataset:
+  - Nombre: Polish Companies Bankruptcy Data
+  - Fuente: UCI ML Repository, id=365
+  - DOI: 10.24432/C5F600
+  - Instancias: 43.405 (empresas × año de pronóstico)
+  - Features: 65 (64 ratios financieros numéricos + columna 'year')
+  - Target: binario — 0 = no quiebra, 1 = quiebra
+  - Desbalance original: ~19:1 (no quiebra vs quiebra)
+  - Valores nulos: presentes en varias columnas (ninguna supera el 50%)
+
+================================================================================
+SECCIÓN 2 — ENTORNO Y DEPENDENCIAS
+================================================================================
+
+Entorno recomendado:
+  - Python 3.13+
+  - Anaconda o venv
+
+Instalar con pip:
+  pip install ucimlrepo xgboost shap mlflow imbalanced-learn \
+              matplotlib seaborn streamlit plotly ollama
+
+Versiones usadas en el proyecto original:
+  - xgboost==3.2.0
+  - mlflow==3.11.1
+  - shap==0.51.0
+  - streamlit (última estable)
+  - plotly (última estable)
+  - ollama (cliente Python)
+  - scikit-learn==1.7.2
+  - pandas==2.3.3
+  - numpy==2.3.5
+
+Modelo LLM local (Ollama):
+  - Instalar Ollama: https://ollama.com
+  - Descargar modelo: ollama pull gemma4:e2b
+  - Levantar servidor: ollama serve
+
+================================================================================
+SECCIÓN 3 — NOTEBOOK PRINCIPAL (credit_scoring_polish.ipynb)
+================================================================================
+
+Organizar el notebook en las siguientes secciones numeradas:
+
+------------------------------------------------------------------------
+3.1 IMPORTS
+------------------------------------------------------------------------
+
+  import pandas as pd
+  import numpy as np
+  import matplotlib.pyplot as plt
+  import seaborn as sns
+  import warnings
+  warnings.filterwarnings('ignore')
+
+  from ucimlrepo import fetch_ucirepo
+  from sklearn.model_selection import train_test_split
+  from sklearn.preprocessing import StandardScaler
+  from sklearn.metrics import (classification_report, confusion_matrix,
+      roc_auc_score, roc_curve, precision_recall_curve, average_precision_score)
+  from sklearn.impute import SimpleImputer
+  from imblearn.over_sampling import SMOTE
+
+  import xgboost as xgb
+  import shap
+  import mlflow
+  import mlflow.xgboost
+
+------------------------------------------------------------------------
+3.2 CARGA DEL DATASET
+------------------------------------------------------------------------
+
+  polish_companies_bankruptcy = fetch_ucirepo(id=365)
+  X = polish_companies_bankruptcy.data.features   # shape: (43405, 65)
+  y = polish_companies_bankruptcy.data.targets    # shape: (43405, 1)
+
+  # Extraer serie del target
+  target_col = y.columns[0]   # columna 'class'
+  y_series = y[target_col]    # valores: 0 o 1
+
+  Columnas de X: ['year', 'A1', 'A2', ..., 'A64']
+  El campo 'year' indica el horizonte de pronóstico (1 a 5 años antes de quiebra).
+
+------------------------------------------------------------------------
+3.3 EDA (Análisis Exploratorio de Datos)
+------------------------------------------------------------------------
+
+  a) Distribución del target:
+     - Calcular value_counts()
+     - Imprimir ratio de desbalance: class_counts[0] / class_counts[1]
+     - Graficar: barplot + pie chart (guardar como 'class_distribution.png')
+
+  b) Valores nulos:
+     - missing_pct = (X.isnull().sum() / len(X) * 100).sort_values(ascending=False)
+     - Imprimir columnas con > 30% de nulos
+     - Graficar barplot (guardar como 'missing_values.png')
+
+  c) Distribución de features clave:
+     - Para las primeras 6 columnas, histogramas separados por clase (0 y 1)
+     - Clipear valores extremos a percentiles 1-99 solo para visualización
+     - Guardar como 'feature_distributions.png'
+
+------------------------------------------------------------------------
+3.4 PREPROCESAMIENTO
+------------------------------------------------------------------------
+
+  Paso 1 — Eliminar columnas con > 50% de nulos:
+    threshold = 0.50
+    cols_to_drop = missing_pct[missing_pct > threshold * 100].index.tolist()
+    X_clean = X.drop(columns=cols_to_drop)
+    (En este dataset, ninguna columna supera el umbral, por lo que X_clean == X)
+
+  Paso 2 — Imputación con mediana:
+    imputer = SimpleImputer(strategy='median')
+    X_imputed = pd.DataFrame(imputer.fit_transform(X_clean), columns=X_clean.columns)
+
+  Paso 3 — Clip de outliers (percentil 1 y 99):
+    for col in X_imputed.columns:
+        q01 = X_imputed[col].quantile(0.01)
+        q99 = X_imputed[col].quantile(0.99)
+        X_imputed[col] = X_imputed[col].clip(q01, q99)
+
+  Paso 4 — Train/Test split estratificado:
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_imputed, y_series,
+        test_size=0.20,
+        random_state=42,
+        stratify=y_series
+    )
+    # Resultado: Train (34724, 65) | Test (8681, 65)
+    # Train positivos: 1673 (4.82%) | Test positivos: 418 (4.82%)
+
+  Paso 5 — Balanceo con SMOTE (solo sobre training set):
+    smote = SMOTE(random_state=42)
+    X_train_bal, y_train_bal = smote.fit_resample(X_train, y_train)
+    # Resultado: (66102, 65) — 33051 de cada clase
+
+------------------------------------------------------------------------
+3.5 ENTRENAMIENTO CON MLFLOW
+------------------------------------------------------------------------
+
+  Configurar MLflow:
+    mlflow.set_tracking_uri("sqlite:///mlflow_credit.db")
+    mlflow.set_experiment("credit-scoring-polish")
+
+  Parámetros del modelo XGBoost (exactos):
+    params = {
+        "n_estimators":      300,
+        "max_depth":         5,
+        "learning_rate":     0.05,
+        "subsample":         0.8,
+        "colsample_bytree":  0.8,
+        "min_child_weight":  5,
+        "gamma":             0.1,
+        "scale_pos_weight":  1,       # 1 porque SMOTE ya balanceó
+        "eval_metric":       "auc",
+        "use_label_encoder": False,
+        "random_state":      42,
+        "n_jobs":            -1
+    }
+
+  Dentro de mlflow.start_run(run_name="xgboost_smote_v1"):
+    - mlflow.log_params(params)
+    - Loguear también: imputer_strategy="median", outlier_clip="p1-p99",
+      balancing="SMOTE", test_size=0.20, features_used=65
+    - model.fit(X_train_bal, y_train_bal, eval_set=[(X_test, y_test)], verbose=50)
+    - Calcular métricas sobre el test set:
+        roc_auc  = roc_auc_score(y_test, y_pred_proba)        # → 0.9491
+        avg_prec = average_precision_score(y_test, y_pred_proba)  # → 0.6824
+        report   = classification_report(y_test, y_pred, output_dict=True)
+    - mlflow.log_metric para: roc_auc, avg_precision, precision_class1,
+      recall_class1, f1_class1
+    - mlflow.xgboost.log_model(model, "xgboost_model")
+    - Guardar run_id = mlflow.active_run().info.run_id
+
+  Resultados esperados del modelo:
+    ROC-AUC:          0.9491
+    Avg Precision:    0.6824
+    Precision quiebra: 0.71
+    Recall quiebra:    0.55
+    F1 quiebra:        0.62
+    Accuracy global:   0.97
+
+------------------------------------------------------------------------
+3.6 EVALUACIÓN VISUAL
+------------------------------------------------------------------------
+
+  Generar en un subplot (1 fila × 3 columnas) y guardar como 'model_evaluation.png':
+    a) Curva ROC con AUC en el label
+    b) Curva Precision-Recall con AP en el label
+    c) Matriz de confusión (heatmap con seaborn)
+
+  Adicionalmente, graficar y guardar como 'score_distribution.png':
+    - Histograma de probabilidades predichas separado por clase real
+    - Línea vertical en 0.5 (umbral por defecto)
+
+------------------------------------------------------------------------
+3.7 EXPLICABILIDAD CON SHAP
+------------------------------------------------------------------------
+
+  # Usar muestra de 500 ejemplos del test set para velocidad
+  sample_size = min(500, len(X_test))
+  X_test_sample = X_test.sample(n=sample_size, random_state=42)
+
+  explainer   = shap.TreeExplainer(model)
+  shap_values = explainer.shap_values(X_test_sample)
+  # shape: (500, 65)
+
+  Generar y guardar:
+    a) shap_importance.png — summary_plot(plot_type="bar", max_display=15)
+    b) shap_beeswarm.png   — summary_plot(max_display=15) [sin plot_type]
+
+  Análisis individual (para una empresa del test set que quebró):
+    quiebras_idx = y_test[y_test == 1].index
+    empresa_ejemplo = X_test.index.get_loc(quiebras_idx[0])
+
+    Función analizar_empresa(index, X_data, y_data, modelo, explainer):
+      - Calcula proba y clase
+      - Extrae top 5 drivers SHAP (por valor absoluto)
+      - Clasifica riesgo: BAJO (<0.2), MEDIO (<0.5), ALTO (<0.75), MUY ALTO (>=0.75)
+      - Imprime tabla: feature | valor | SHAP | efecto (↑/↓)
+      - Retorna (proba, drivers_detail)
+
+    Generar y guardar 'shap_waterfall_empresa.png':
+      empresa_shap = shap.Explanation(
+          values=explainer.shap_values(X_test.iloc[[empresa_ejemplo]])[0],
+          base_values=explainer.expected_value,
+          data=X_test.iloc[empresa_ejemplo].values,
+          feature_names=X_test.columns.tolist()
+      )
+      shap.plots.waterfall(empresa_shap, max_display=10, show=False)
+
+------------------------------------------------------------------------
+3.8 REGISTRO DEL MODELO EN MLFLOW MODEL REGISTRY
+------------------------------------------------------------------------
+
+  from mlflow.tracking import MlflowClient
+
+  MODEL_NAME = 'credit-scoring-polish'
+
+  model_uri  = f'runs:/{run_id}/xgboost_model'
+  registered = mlflow.register_model(model_uri=model_uri, name=MODEL_NAME)
+
+  # Asignar alias de producción
+  client  = MlflowClient(tracking_uri='sqlite:///mlflow_credit.db')
+  client.set_registered_model_alias(
+      name=MODEL_NAME,
+      alias='production_80',
+      version=registered.version
+  )
+  # URI resultante: models:/credit-scoring-polish@production_80
+
+------------------------------------------------------------------------
+3.9 API REST CON MLFLOW SERVING
+------------------------------------------------------------------------
+
+  Comando para levantar en terminal (PowerShell):
+    $env:MLFLOW_TRACKING_URI = "sqlite:///C:/ruta/al/mlflow_credit.db"
+    mlflow models serve --model-uri "models:/credit-scoring-polish@production_80" \
+                        --port 5002 --workers 1 --env-manager local --no-conda
+
+  Formato de request (POST http://localhost:5002/invocations):
+    {
+      "dataframe_split": {
+        "columns": ["year", "A1", "A2", ..., "A64"],
+        "data": [[valores...]]
+      }
+    }
+
+  Formato de respuesta:
+    {"predictions": [0]}   ← clase predicha (0 o 1)
+
+  Función Python para invocar la API:
+    def score_empresa_via_api(features_dict: dict, url: str) -> dict:
+        df_input = pd.DataFrame([features_dict])[feature_columns]
+        payload  = {"dataframe_split": {"columns": df_input.columns.tolist(),
+                                        "data": df_input.values.tolist()}}
+        resp     = requests.post(url, headers={"Content-Type": "application/json"},
+                                 data=json.dumps(payload))
+        pred = resp.json()["predictions"][0]
+        return {"clase_predicha": int(pred),
+                "riesgo": "Quiebra" if pred == 1 else "No quiebra",
+                "status_api": resp.status_code}
+
+------------------------------------------------------------------------
+3.10 AGENTE IA NARRATIVO (OLLAMA + GEMMA LOCAL)
+------------------------------------------------------------------------
+
+  import ollama
+
+  OLLAMA_MODEL = 'gemma4:e2b'
+
+  Diccionario FEATURE_DESC (mapea código → descripción en español):
+    FEATURE_DESC = {
+        'year': 'horizonte de pronóstico (años antes de quiebra)',
+        'A1':  'utilidad neta / activos totales',
+        'A2':  'pasivos totales / activos totales',
+        'A3':  'capital de trabajo / activos totales',
+        'A4':  'activos corrientes / pasivos corrientes (liquidez)',
+        'A5':  'ciclo de caja en días',
+        'A6':  'utilidades retenidas / activos totales',
+        'A7':  'EBIT / activos totales',
+        'A8':  'patrimonio contable / pasivos totales',
+        'A9':  'ventas / activos totales (rotación)',
+        'A10': 'patrimonio / activos totales',
+        'A17': 'activos totales / pasivos totales',
+        'A18': 'utilidad bruta / activos totales',
+        'A22': 'utilidad operativa / activos totales',
+        'A23': 'utilidad neta / ventas (margen neto)',
+        'A26': '(utilidad neta + depreciación) / pasivos totales',
+        'A27': 'utilidad operativa / gastos financieros',
+        'A29': 'logaritmo de activos totales (tamaño empresa)',
+        'A35': 'utilidad en ventas / activos totales',
+        'A36': 'ventas totales / activos totales',
+        'A39': 'margen de utilidad en ventas',
+        'A40': 'prueba ácida (sin inventarios)',
+        'A42': 'margen operativo',
+        'A44': 'días de cobro (cuentas por cobrar / ventas × 365)',
+        'A48': 'EBITDA / activos totales',
+        'A49': 'EBITDA / ventas',
+        'A56': 'margen bruto (ventas - costos) / ventas',
+        'A58': 'costos totales / ventas totales',
+        'A61': 'rotación de cuentas por cobrar',
+        'A63': 'ventas / pasivos corrientes',
+        'A64': 'ventas / activos fijos',
+        # Agregar el resto de A11 a A64 según variable_info del dataset
+    }
+
+  Función obtener_drivers(empresa_df, explainer, top_n=6):
+    - Calcula SHAP values para la empresa
+    - Retorna dict con top N features: {feature: {valor, shap, descripcion, sube_riesgo}}
+
+  Función clasificar_riesgo(proba):
+    if proba < 0.20: return 'BAJO'
+    if proba < 0.50: return 'MEDIO'
+    if proba < 0.75: return 'ALTO'
+    return 'MUY ALTO'
+
+  Función construir_prompt(score_pct, nivel, drivers, empresa_id):
+    Prompt estructurado que instruye al modelo a:
+      1. Actuar como analista senior de riesgo crediticio
+      2. Recibir el score y los drivers como contexto
+      3. Redactar dictamen de máximo 200 palabras en español
+      4. NO mencionar SHAP, XGBoost ni términos de ML
+      5. Tono formal de comité de crédito
+
+  Función agente_credit_scoring(empresa_df, modelo, explainer, empresa_id):
+    Orquesta: score → drivers → prompt → ollama.chat() → dictamen
+    Retorna dict con: empresa_id, score_pct, nivel_riesgo, clase, drivers, dictamen_ia
+
+================================================================================
+SECCIÓN 4 — SCRIPT DE DATOS (generate_clients_db.py)
+================================================================================
+
+  Propósito: Script de ejecución única que genera clients.csv con IDs asignados.
+
+  Lógica:
+    1. fetch_ucirepo(id=365) → X, y
+    2. SimpleImputer(strategy='median').fit_transform(X)
+    3. Clip percentil 1-99 para cada columna
+    4. train_test_split(test_size=0.20, random_state=42, stratify=y)
+       → usar EXACTAMENTE los mismos parámetros que en el notebook
+    5. Asignar IDs: [f"CLI-{i+1:05d}" for i in range(len(X_test))]
+    6. Agregar columna 'class' con y_test
+    7. Guardar como clients.csv (sin index, con columna 'id' como primera columna)
+
+  Resultado: 8.681 filas × 67 columnas (id + 65 features + class)
+             Rango: CLI-00001 a CLI-08681
+             418 empresas con quiebra real (class=1)
+
+================================================================================
+SECCIÓN 5 — APP STREAMLIT (app.py)
+================================================================================
+
+------------------------------------------------------------------------
+5.1 CONFIGURACIÓN GENERAL
+------------------------------------------------------------------------
+
+  st.set_page_config(
+      page_title="Credit Scoring Assistant",
+      page_icon="🏦",
+      layout="wide",
+  )
+
+  Constantes del archivo:
+    MLFLOW_TRACKING_URI = "sqlite:///mlflow_credit.db"
+    MODEL_URI           = "models:/credit-scoring-polish@production_80"
+    CLIENTS_CSV         = "clients.csv"
+    OLLAMA_MODEL        = "gemma4:e2b"
+
+------------------------------------------------------------------------
+5.2 CACHING DE RECURSOS
+------------------------------------------------------------------------
+
+  @st.cache_resource(show_spinner="Cargando modelo XGBoost y SHAP explainer...")
+  def load_model_and_explainer():
+      mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+      model    = mlflow.xgboost.load_model(MODEL_URI)
+      explainer = shap.TreeExplainer(model)
+      return model, explainer
+
+  @st.cache_data(show_spinner="Cargando base de clientes...")
+  def load_clients() -> pd.DataFrame:
+      return pd.read_csv(CLIENTS_CSV, index_col="id")
+
+  El modelo y explainer se cargan UNA SOLA VEZ en toda la sesión.
+  El CSV de clientes también se cachea para no releerlo en cada interacción.
+
+------------------------------------------------------------------------
+5.3 SESSION STATE
+------------------------------------------------------------------------
+
+  st.session_state.messages  → lista de dicts {role, content}
+                                "user" o "assistant"
+  st.session_state.history   → lista de dicts {id, score, nivel, emoji, clase_real}
+                                Se acumula por cliente analizado en la sesión
+
+------------------------------------------------------------------------
+5.4 SIDEBAR
+------------------------------------------------------------------------
+
+  Título: "🏦 Credit Scoring" + subtítulo descriptivo
+
+  Sección "Métricas del modelo" (valores fijos del modelo entrenado):
+    ROC-AUC: 0.9491 | Avg Precision: 0.6824
+    F1 quiebra: 0.62 | Precisión: 0.71
+
+  Sección "Clientes analizados" (desde session_state.history):
+    Por cada entrada: `CLI-XXXXX` [emoji_riesgo] NIVEL (score%) [emoji_clase_real]
+    emoji_clase_real: 🔴 si quebró, 🟢 si no
+
+  Sección "Estado del sistema":
+    ✅/❌ Base de clientes (clients.csv existe?)
+    ✅/⚠️ MLflow Model Registry (intenta conectar)
+    ✅/❌ Ollama / Gemma (intenta ollama.list())
+
+  Botón "🗑️ Limpiar sesión":
+    Limpia messages y history, llama st.rerun()
+
+------------------------------------------------------------------------
+5.5 PARSING DE INTENCIÓN
+------------------------------------------------------------------------
+
+  def parse_intent(text: str) -> tuple[str, str | None]:
+    - Entrada "ayuda", "help" o "?" → ("help", None)
+    - Regex r"CLI[- ]?(\d+)" → ("analyze", "CLI-XXXXX") con zero-padding a 5 dígitos
+    - Solo dígitos → ("analyze", f"CLI-{int(text):05d}")
+    - Cualquier otra cosa → ("unknown", None)
+
+  Variantes que debe aceptar:
+    "analiza CLI-00418", "CLI-418", "CLI 418", "418", "analiza el 418"
+
+------------------------------------------------------------------------
+5.6 FLUJO analyze_client(client_id)
+------------------------------------------------------------------------
+
+  Renderizar TODO dentro de st.chat_message("assistant"):
+
+  Paso 1 — Lookup en CSV:
+    row = clients.loc[client_id]   # KeyError si no existe
+    Si no existe: st.error(mensaje con rango válido de IDs)
+
+  Paso 2 — Separar features y clase real:
+    feature_cols = [c for c in clients.columns if c != "class"]
+    features_df  = pd.DataFrame([row[feature_cols].values], columns=feature_cols)
+    clase_real   = int(row["class"])
+
+  Paso 3 — Score y clasificación:
+    proba = float(model.predict_proba(features_df)[0][1])
+    nivel, emoji = classify_risk(proba)
+      → BAJO 🟢 / MEDIO 🟡 / ALTO 🟠 / MUY ALTO 🔴
+
+  Paso 4 — SHAP:
+    shap_vals = explainer.shap_values(features_df)[0]   # array (65,)
+    drivers   = get_top_drivers(shap_vals, features_df, n=6)
+    Cada driver: {feature, descripcion, valor, shap, sube_riesgo}
+
+  Paso 5 — Renderizar:
+    a) st.markdown(f"### {emoji} Análisis — `{client_id}`")
+    b) st.columns(3) con st.metric():
+         col1: "Score de quiebra" → f"{score_pct:.1f}%"
+         col2: "Nivel de riesgo"  → f"{emoji} {nivel}"
+         col3: "Clase real"       → f"{real_icon} {label}"
+    c) st.plotly_chart(shap_chart(drivers), use_container_width=True)
+    d) st.expander("Ver detalle de los 6 ratios más influyentes"):
+         DataFrame con columnas: Ratio | Descripción | Valor | Impacto SHAP | Efecto
+    e) st.markdown("**Dictamen del Asistente IA (Gemma via Ollama):**")
+    f) st.write_stream(stream_dictamen(prompt))
+         → streaming character por character del texto de Gemma
+
+  Paso 6 — Agregar al historial:
+    st.session_state.history.append({id, score, nivel, emoji, clase_real})
+
+------------------------------------------------------------------------
+5.7 GRÁFICO SHAP (Plotly)
+------------------------------------------------------------------------
+
+  def shap_chart(drivers: list[dict]) -> go.Figure:
+    - go.Bar horizontal
+    - Label: "FEATURE\nDescripción corta (max 40 chars)"
+    - Color: rojo (#e74c3c) si shap > 0, verde (#2ecc71) si shap < 0
+    - Texto externo: f"{shap:+.4f}"
+    - Línea vertical en x=0
+    - Fondo oscuro (#0e1117) para coherencia con tema Streamlit dark
+    - Título: "Factores de impacto en el score (SHAP)"
+    - Eje X: "Impacto sobre la probabilidad de quiebra"
+    - height=320
+
+------------------------------------------------------------------------
+5.8 STREAMING DEL DICTAMEN
+------------------------------------------------------------------------
+
+  def stream_dictamen(prompt: str):
+    stream = ollama.chat(
+        model=OLLAMA_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        stream=True,
+    )
+    for chunk in stream:
+        yield chunk["message"]["content"]
+
+  Si Ollama no está disponible, capturar excepción y hacer yield del mensaje de error.
+  Usar dentro del chat con: st.write_stream(stream_dictamen(prompt))
+
+------------------------------------------------------------------------
+5.9 MENSAJES DEL SISTEMA
+------------------------------------------------------------------------
+
+  | Situación               | Respuesta al usuario                                          |
+  |-------------------------|---------------------------------------------------------------|
+  | ID no encontrado        | st.error con rango CLI-00001 a CLI-08681                      |
+  | clients.csv no existe   | st.error con instrucción de ejecutar generate_clients_db.py   |
+  | Ollama no disponible    | yield del error dentro del stream, sugerencia "ollama serve"  |
+  | Input no reconocido     | Sugerencia con ejemplos de uso y referencia a "ayuda"         |
+  | Intent "help"           | Markdown con lista de comandos disponibles y rangos de IDs    |
+
+------------------------------------------------------------------------
+5.10 FLUJO PRINCIPAL (main)
+------------------------------------------------------------------------
+
+  1. st.set_page_config(...)
+  2. Inicializar session_state si no existe
+  3. render_sidebar()
+  4. st.title + st.caption
+  5. Verificar que clients.csv existe → st.stop() si no
+  6. Pre-cargar recursos (load_clients() y load_model_and_explainer())
+  7. Renderizar historial de mensajes del chat (solo texto resumen, no re-renderizar gráficos)
+  8. user_input = st.chat_input(...)
+  9. Si hay input:
+       a. Mostrar mensaje del usuario con st.chat_message("user")
+       b. Guardar en session_state.messages
+       c. parse_intent(user_input) → intent, client_id
+       d. Con st.chat_message("assistant"):
+            - "analyze" → analyze_client(client_id)
+            - "help"    → st.markdown(HELP_TEXT)
+            - "unknown" → mensaje de error con sugerencias
+       e. Guardar resumen en session_state.messages
+
+================================================================================
+SECCIÓN 6 — ESTRUCTURA DE ARCHIVOS FINAL
+================================================================================
+
+  code/
+  ├── credit_scoring_polish.ipynb   ← pipeline ML completo (13 secciones)
+  ├── generate_clients_db.py        ← script one-time para crear clients.csv
+  ├── app.py                        ← Streamlit app conversacional
+  ├── clients.csv                   ← 8681 clientes con IDs CLI-XXXXX (generado)
+  ├── mlflow_credit.db              ← SQLite de MLflow tracking (generado)
+  ├── mlruns/                       ← artefactos MLflow (generado automáticamente)
+  ├── class_distribution.png        ← EDA
+  ├── missing_values.png            ← EDA
+  ├── feature_distributions.png     ← EDA
+  ├── model_evaluation.png          ← ROC + PR + confusion matrix
+  ├── score_distribution.png        ← distribución de scores por clase
+  ├── shap_importance.png           ← importancia global SHAP
+  ├── shap_beeswarm.png             ← beeswarm SHAP
+  └── shap_waterfall_empresa.png    ← explicación individual SHAP
+
+================================================================================
+SECCIÓN 7 — COMANDOS PARA LEVANTAR TODO EL SISTEMA
+================================================================================
+
+  # Terminal 1 — Ollama (LLM local)
+  ollama serve
+
+  # Terminal 2 — MLflow UI (opcional, para explorar experimentos)
+  mlflow ui --workers 1 --port 5001 \
+            --backend-store-uri sqlite:///mlflow_credit.db
+
+  # Terminal 3 — API REST del modelo (opcional, para integración externa)
+  $env:MLFLOW_TRACKING_URI = "sqlite:///C:/ruta/completa/mlflow_credit.db"
+  mlflow models serve --model-uri "models:/credit-scoring-polish@production_80" \
+                      --port 5002 --workers 1 --env-manager local --no-conda
+
+  # Terminal 4 — App Streamlit
+  cd ruta/al/proyecto/code
+  streamlit run app.py
+
+  Accesos:
+    Streamlit app → http://localhost:8501
+    MLflow UI     → http://localhost:5001
+    MLflow API    → http://localhost:5002/invocations
+
+================================================================================
+SECCIÓN 8 — CHECKLIST DE VERIFICACIÓN
+================================================================================
+
+  [ ] generate_clients_db.py produce clients.csv con 8681 filas y 67 columnas
+  [ ] El notebook completo ejecuta sin errores de inicio a fin
+  [ ] mlflow_credit.db existe y contiene el experimento "credit-scoring-polish"
+  [ ] El modelo está registrado con alias "production_80"
+  [ ] streamlit run app.py arranca sin ImportError
+  [ ] Escribir "analiza CLI-00418" produce score ~83%, gráfico SHAP y dictamen Gemma
+  [ ] Escribir "analiza CLI-00001" produce score bajo (empresa sin quiebra)
+  [ ] El sidebar acumula el historial durante la sesión
+  [ ] Escribir "CLI-99999" produce mensaje de error con rango válido
+  [ ] Escribir "ayuda" muestra el mensaje de comandos disponibles
+  [ ] El botón "Limpiar sesión" vacía el chat y el historial
+
+================================================================================
+NOTAS IMPORTANTES
+================================================================================
+
+  1. El split train/test usa random_state=42. Si se usa cualquier otro valor,
+     los IDs del CSV no coincidirán con las filas del modelo. No cambiar.
+
+  2. SMOTE se aplica SOLO al training set, nunca al test set. El test set
+     mantiene el desbalance original para una evaluación realista.
+
+  3. scale_pos_weight=1 en XGBoost porque SMOTE ya balanceó la clase.
+     Si se elimina SMOTE, usar scale_pos_weight=19 (ratio del desbalance original).
+
+  4. El SHAP explainer (TreeExplainer) corre localmente en Streamlit con el
+     modelo cargado vía mlflow.xgboost.load_model(). La API REST de MLflow
+     (puerto 5002) es opcional y solo devuelve la clase (0/1), no probabilidades.
+
+  5. Para obtener probabilidades se usa model.predict_proba() directamente
+     sobre el modelo cargado en memoria, no via la API REST.
+
+  6. El modelo Ollama (gemma4:e2b) debe estar descargado antes de ejecutar la app:
+     ollama pull gemma4:e2b
+
+  7. Si gemma4:e2b no está disponible, puede reemplazarse por cualquier modelo
+     Ollama compatible (gemma2:2b, llama3.2:3b, qwen2.5:3b, etc.).
+     Solo cambiar la constante OLLAMA_MODEL en app.py.
+
+================================================================================
+FIN DEL PROMPT
+================================================================================

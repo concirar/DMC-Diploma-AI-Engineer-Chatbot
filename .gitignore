@@ -1,0 +1,12 @@
+# Datos generados localmente (regenerables con scripts)
+clients.csv
+mlflow_credit.db
+
+# MLflow artifacts grandes
+mlruns/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
